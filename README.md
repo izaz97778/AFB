@@ -1,8 +1,3 @@
-Here's a clean and complete README.md for your Telegram Forwarding Bot with MongoDB tracking and floodwait handling:
-
-
----
-
 # 📤 Telegram Auto Forward Bot
 
 A powerful Telegram bot that auto-forwards messages from multiple source channels to a target channel.  
