@@ -1,32 +1,29 @@
 import uvloop
 import asyncio
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, ChannelInvalid
 from pymongo import MongoClient
 import re
 from os import environ
-import asyncio
 
 print("Starting...")
 uvloop.install()
 
-# Regex for checking numeric IDs (e.g. -100...)
-id_pattern = re.compile(r'^.\d+$')
+id_pattern = re.compile(r'^-?\d+$')
 
 # Load from environment
 SESSION = environ.get("SESSION", "")
 API_ID = int(environ.get("API_ID", ""))
 API_HASH = environ.get("API_HASH", "")
 TARGET_CHANNEL = int(environ.get("TARGET_CHANNEL", ""))
-SOURCE_CHANNELS = [int(ch) if id_pattern.search(ch) else ch for ch in environ.get("SOURCE_CHANNELS", "").split()]
+SOURCE_CHANNELS = [int(ch) if id_pattern.match(ch) else ch for ch in environ.get("SOURCE_CHANNELS", "").split()]
 MONGO_URI = environ.get("MONGO_URI", "mongodb://localhost:27017")
 
-# Setup MongoDB
+# MongoDB setup
 mongo = MongoClient(MONGO_URI)
 db = mongo["forwarding_bot"]
 state_collection = db["forward_state"]
 
-# --- MongoDB Helpers ---
 def get_last_forwarded(chat_id):
     doc = state_collection.find_one({"_id": str(chat_id)})
     return doc["last_message_id"] if doc else 0
@@ -38,7 +35,6 @@ def save_last_forwarded(chat_id, message_id):
         upsert=True
     )
 
-# --- Pyrogram client setup ---
 app = Client(
     name=SESSION,
     session_string=SESSION,
@@ -46,35 +42,62 @@ app = Client(
     api_hash=API_HASH
 )
 
-# --- Start the bot ---
-async def start_bot():
-    await app.start()
-    user = await app.get_me()
-    print(f"âœ… Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
-    await asyncio.Event().wait()
+async def resume_forwarding():
+    for source in SOURCE_CHANNELS:
+        try:
+            last_id = get_last_forwarded(source)
+            print(f"Resuming from {last_id} in {source}")
 
-# --- Message Forward Handler ---
+            async for message in app.get_chat_history(source, offset_id=last_id, reverse=True):
+                if message.id <= last_id:
+                    continue
+
+                while True:
+                    try:
+                        await message.copy(TARGET_CHANNEL)
+                        print(f"✅ Resumed and forwarded message {message.id} from {source}")
+                        save_last_forwarded(source, message.id)
+                        break
+                    except FloodWait as e:
+                        print(f"⏳ FloodWait: Sleeping for {e.value}s")
+                        await asyncio.sleep(e.value)
+                    except Exception as e:
+                        print(f"❌ Error forwarding message {message.id} from {source}: {e}")
+                        break
+
+        except ChannelInvalid:
+            print(f"❌ Invalid channel: {source}")
+        except Exception as e:
+            print(f"❌ Error with channel {source}: {e}")
+
 @app.on_message(filters.channel)
-async def forward_messages(client, message):
+async def forward_new_messages(client, message):
     if message.chat.id in SOURCE_CHANNELS:
-        chat_id = str(message.chat.id)
-        last_id = get_last_forwarded(chat_id)
+        last_id = get_last_forwarded(message.chat.id)
 
         if message.id <= last_id:
-            return  # Already forwarded
+            return
 
         while True:
             try:
                 await message.copy(TARGET_CHANNEL)
-                print(f"âœ… Forwarded message {message.id} from {chat_id} to {TARGET_CHANNEL}")
-                save_last_forwarded(chat_id, message.id)
+                print(f"✅ Forwarded new message {message.id} from {message.chat.id}")
+                save_last_forwarded(message.chat.id, message.id)
                 break
             except FloodWait as e:
-                print(f"â³ FloodWait: Waiting {e.value}s for message {message.id} from {chat_id}")
+                print(f"⏳ FloodWait for new message: Sleeping {e.value}s")
                 await asyncio.sleep(e.value)
             except Exception as e:
-                print(f"âŒ Error forwarding message {message.id} from {chat_id}: {e}")
+                print(f"❌ Error forwarding new message {message.id}: {e}")
                 break
 
-# --- Run the app ---
+async def start_bot():
+    await app.start()
+    user = await app.get_me()
+    print(f"✅ Logged in as: {user.first_name} (@{user.username})")
+
+    await resume_forwarding()
+    print("✅ Resume complete. Listening for new messages...")
+    await asyncio.Event().wait()
+
 app.run(start_bot())
