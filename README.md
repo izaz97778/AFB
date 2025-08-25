@@ -39,14 +39,12 @@ Built using [Pyrogram](https://github.com/pyrogram/pyrogram), supports per-chann
 Edit the following variables in `bot.py`:
 
 ```python
-API_ID = "your_api_id"
-API_HASH = "your_api_hash"
-BOT_TOKEN = "your_bot_token"
-
-MONGO_URI = "your_mongodb_uri"
-
-SOURCE_CHANNELS = [-1001234567890, -1009876543210]  # Add as many as you want
-TARGET_CHANNEL = -1001122334455
+API_ID=
+API_HASH=
+BOT_TOKEN=
+MONGO_URI=
+SOURCE_CHANNELS=
+TARGET_CHANNEL=
 
 
 ---
