@@ -75,10 +75,22 @@ async def forward_one(chat_id, message):
 async def catch_up():
     for src in SOURCE_CHANNELS:
         last_id = get_last_forwarded(src)
+
+        # If this is a new source channel → skip history
+        if last_id == 0:
+            try:
+                # Fetch the latest message in the channel
+                async for m in app.get_chat_history(src, limit=1):
+                    save_last_forwarded(src, m.id)
+                    last_id = m.id
+                    print(f"🆕 Initialized {src} at message_id {last_id} (skipping history)")
+            except Exception as e:
+                print(f"⚠️ Could not initialize {src}: {e}")
+                continue
+
         print(f"📌 Catching up {src} from message_id > {last_id} ...")
         try:
             async for msg in app.get_chat_history(src, offset_id=last_id, reverse=True):
-                # Skip service + ensure no duplicates even if restarted mid-batch
                 if getattr(msg, "service", False) or msg.id <= get_last_forwarded(src):
                     continue
                 await forward_one(src, msg)
@@ -88,7 +100,9 @@ async def catch_up():
 # --- On new messages (only from configured sources) ---
 @app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
-    await forward_one(message.chat.id, message)
+    # Ensure we only forward messages newer than initialized last_id
+    if message.id > get_last_forwarded(message.chat.id):
+        await forward_one(message.chat.id, message)
 
 # --- Main lifecycle (manual control; no app.run here) ---
 async def run_with_retries():
