@@ -3,7 +3,7 @@ import asyncio
 import os
 import re
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden, TransportError
+from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden, ChannelInvalid
 from pymongo import MongoClient
 
 print("Starting...")
@@ -51,7 +51,7 @@ counters = {
     "skipped": 0
 }
 
-# --- Forwarding worker with transport flood handling ---
+# --- Forwarding worker ---
 async def forward_worker():
     while True:
         chat_id, msg = await forward_queue.get()
@@ -74,18 +74,19 @@ async def forward_one(chat_id, message):
         except FloodWait as e:
             print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id}")
             await asyncio.sleep(e.value)
-        except TransportError as e:
-            print(f"⚠️ Transport flood detected, pausing 30s: {e}")
-            await asyncio.sleep(30)
         except ChatWriteForbidden:
             print(f"❌ Cannot write to target channel {TARGET_CHANNEL}. Make sure userbot is admin.")
             counters["skipped"] += 1
             break
+        except RPCError as e:
+            print(f"⚠️ RPCError: {e}, pausing 30s")
+            await asyncio.sleep(30)
         except Exception as e:
             print(f"❌ Error forwarding message {message.id}: {e}")
             counters["skipped"] += 1
             break
 
+# --- Only forward new messages from last saved message ---
 @app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
     if message.id > get_last_forwarded(message.chat.id):
@@ -93,48 +94,22 @@ async def forward_messages(client, message):
         counters["queued"] += 1
         print(f"📥 New message queued {message.id} from {message.chat.id} | Queued: {counters['queued']}")
 
-async def run_with_retries():
-    retries = 0
-    MAX_RETRIES = 5
+async def run_bot():
+    await app.start()
+    user = await app.get_me()
+    print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
 
-    while True:
-        try:
-            await app.start()
-            user = await app.get_me()
-            print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
+    try:
+        chat = await app.get_chat(TARGET_CHANNEL)
+        print(f"✅ Target chat accessible: {chat.title}")
+    except Exception as e:
+        print(f"❌ Cannot access target chat: {e}")
 
-            try:
-                chat = await app.get_chat(TARGET_CHANNEL)
-                print(f"✅ Target chat accessible: {chat.title}")
-            except Exception as e:
-                print(f"❌ Cannot access target chat: {e}")
+    # Start the forward worker
+    asyncio.create_task(forward_worker())
 
-            asyncio.create_task(forward_worker())
-            await asyncio.Event().wait()
-
-        except RPCError as e:
-            if "PERSISTENT_TIMESTAMP_OUTDATED" in str(e):
-                retries += 1
-                print(f"⚠️ Persistent timestamp error, retry {retries}/{MAX_RETRIES}")
-                if retries >= MAX_RETRIES:
-                    print("🗑️ Resetting session...")
-                    try:
-                        os.remove(f"{SESSION}.session")
-                    except FileNotFoundError:
-                        pass
-                    retries = 0
-            else:
-                print(f"⚠️ RPCError: {e}")
-        except Exception as e:
-            print(f"⚠️ Unexpected error: {e}")
-        finally:
-            if app.is_connected:
-                try:
-                    await app.stop()
-                except Exception:
-                    pass
-
-        await asyncio.sleep(5)
+    # Keep running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(run_with_retries())
+    asyncio.run(run_bot())
