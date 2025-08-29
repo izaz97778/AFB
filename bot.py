@@ -1,30 +1,32 @@
 import uvloop
 import asyncio
-import os
-import re
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden, ChannelInvalid
+from pyrogram.errors import FloodWait
 from pymongo import MongoClient
+import re
+from os import environ
+import asyncio
 
 print("Starting...")
 uvloop.install()
 
-id_pattern = re.compile(r"^-?\d+$")
+# Regex for checking numeric IDs (e.g. -100...)
+id_pattern = re.compile(r'^.\d+$')
 
-SESSION = os.environ.get("SESSION", "")
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-TARGET_CHANNEL = int(os.environ.get("TARGET_CHANNEL", "0"))
-SOURCE_CHANNELS = [
-    int(ch) if id_pattern.search(ch) else ch
-    for ch in os.environ.get("SOURCE_CHANNELS", "").split()
-]
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+# Load from environment
+SESSION = environ.get("SESSION", "")
+API_ID = int(environ.get("API_ID", ""))
+API_HASH = environ.get("API_HASH", "")
+TARGET_CHANNEL = int(environ.get("TARGET_CHANNEL", ""))
+SOURCE_CHANNELS = [int(ch) if id_pattern.search(ch) else ch for ch in environ.get("SOURCE_CHANNELS", "").split()]
+MONGO_URI = environ.get("MONGO_URI", "mongodb://localhost:27017")
 
+# Setup MongoDB
 mongo = MongoClient(MONGO_URI)
 db = mongo["forwarding_bot"]
 state_collection = db["forward_state"]
 
+# --- MongoDB Helpers ---
 def get_last_forwarded(chat_id):
     doc = state_collection.find_one({"_id": str(chat_id)})
     return doc["last_message_id"] if doc else 0
@@ -36,80 +38,43 @@ def save_last_forwarded(chat_id, message_id):
         upsert=True
     )
 
+# --- Pyrogram client setup ---
 app = Client(
-    name="forwarder",
+    name=SESSION,
     session_string=SESSION,
     api_id=API_ID,
     api_hash=API_HASH
 )
 
-forward_queue = asyncio.Queue()
-
-counters = {
-    "queued": 0,
-    "forwarded": 0,
-    "skipped": 0
-}
-
-# --- Forwarding worker ---
-async def forward_worker():
-    while True:
-        chat_id, msg = await forward_queue.get()
-        await forward_one(chat_id, msg)
-        forward_queue.task_done()
-
-async def forward_one(chat_id, message):
-    if getattr(message, "service", False) or message.id <= get_last_forwarded(chat_id):
-        counters["skipped"] += 1
-        return
-
-    while True:
-        try:
-            await message.copy(TARGET_CHANNEL)
-            save_last_forwarded(chat_id, message.id)
-            counters["forwarded"] += 1
-            print(f"✅ Forwarded message {message.id} from {chat_id} "
-                  f"| Forwarded: {counters['forwarded']} | Queued: {counters['queued']} | Skipped: {counters['skipped']}")
-            break
-        except FloodWait as e:
-            print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id}")
-            await asyncio.sleep(e.value)
-        except ChatWriteForbidden:
-            print(f"❌ Cannot write to target channel {TARGET_CHANNEL}. Make sure userbot is admin.")
-            counters["skipped"] += 1
-            break
-        except RPCError as e:
-            print(f"⚠️ RPCError: {e}, pausing 30s")
-            await asyncio.sleep(30)
-        except Exception as e:
-            print(f"❌ Error forwarding message {message.id}: {e}")
-            counters["skipped"] += 1
-            break
-
-# --- Only forward new messages from last saved message ---
-@app.on_message(filters.chat(SOURCE_CHANNELS))
-async def forward_messages(client, message):
-    if message.id > get_last_forwarded(message.chat.id):
-        await forward_queue.put((message.chat.id, message))
-        counters["queued"] += 1
-        print(f"📥 New message queued {message.id} from {message.chat.id} | Queued: {counters['queued']}")
-
-async def run_bot():
+# --- Start the bot ---
+async def start_bot():
     await app.start()
     user = await app.get_me()
-    print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
-
-    try:
-        chat = await app.get_chat(TARGET_CHANNEL)
-        print(f"✅ Target chat accessible: {chat.title}")
-    except Exception as e:
-        print(f"❌ Cannot access target chat: {e}")
-
-    # Start the forward worker
-    asyncio.create_task(forward_worker())
-
-    # Keep running
+    print(f"âœ… Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
     await asyncio.Event().wait()
 
-if __name__ == "__main__":
-    asyncio.run(run_bot())
+# --- Message Forward Handler ---
+@app.on_message(filters.channel)
+async def forward_messages(client, message):
+    if message.chat.id in SOURCE_CHANNELS:
+        chat_id = str(message.chat.id)
+        last_id = get_last_forwarded(chat_id)
+
+        if message.id <= last_id:
+            return  # Already forwarded
+
+        while True:
+            try:
+                await message.copy(TARGET_CHANNEL)
+                print(f"âœ… Forwarded message {message.id} from {chat_id} to {TARGET_CHANNEL}")
+                save_last_forwarded(chat_id, message.id)
+                break
+            except FloodWait as e:
+                print(f"â³ FloodWait: Waiting {e.value}s for message {message.id} from {chat_id}")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                print(f"âŒ Error forwarding message {message.id} from {chat_id}: {e}")
+                break
+
+# --- Run the app ---
+app.run(start_bot())
