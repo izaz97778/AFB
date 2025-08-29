@@ -3,7 +3,7 @@ import asyncio
 import os
 import re
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden
 from pymongo import MongoClient
 
 print("Starting...")
@@ -42,7 +42,7 @@ def save_last_forwarded(chat_id, message_id):
 
 # --- Pyrogram client setup ---
 app = Client(
-    name=SESSION,
+    name="forwarder",          # fixed name
     session_string=SESSION,
     api_id=API_ID,
     api_hash=API_HASH
@@ -50,11 +50,9 @@ app = Client(
 
 # --- Forwarding helper ---
 async def forward_one(chat_id, message):
-    # Skip service/unsupported messages
     if getattr(message, "service", False):
         return
 
-    # Dedup (double-check against Mongo in case of overlap)
     if message.id <= get_last_forwarded(chat_id):
         return
 
@@ -67,6 +65,9 @@ async def forward_one(chat_id, message):
         except FloodWait as e:
             print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id} from {chat_id}")
             await asyncio.sleep(e.value)
+        except ChatWriteForbidden:
+            print(f"❌ Cannot write to target channel {TARGET_CHANNEL}. Make sure userbot is admin.")
+            break
         except Exception as e:
             print(f"❌ Error forwarding message {message.id} from {chat_id}: {e}")
             break
@@ -79,7 +80,6 @@ async def catch_up():
         # If this is a new source channel → skip history
         if last_id == 0:
             try:
-                # Fetch the latest message in the channel
                 async for m in app.get_chat_history(src, limit=1):
                     save_last_forwarded(src, m.id)
                     last_id = m.id
@@ -90,21 +90,22 @@ async def catch_up():
 
         print(f"📌 Catching up {src} from message_id > {last_id} ...")
         try:
-            async for msg in app.get_chat_history(src, offset_id=last_id, reverse=True):
+            # Fetch messages newer than last_id
+            async for msg in app.get_chat_history(src, offset_id=last_id - 1, reverse=True, limit=1000):
                 if getattr(msg, "service", False) or msg.id <= get_last_forwarded(src):
                     continue
+                print(f"➡️ Found message {msg.id} from {src}, forwarding...")
                 await forward_one(src, msg)
         except Exception as e:
             print(f"⚠️ Error in catch-up for {src}: {e}")
 
-# --- On new messages (only from configured sources) ---
+# --- On new messages ---
 @app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
-    # Ensure we only forward messages newer than initialized last_id
     if message.id > get_last_forwarded(message.chat.id):
         await forward_one(message.chat.id, message)
 
-# --- Main lifecycle (manual control; no app.run here) ---
+# --- Main lifecycle ---
 async def run_with_retries():
     retries = 0
     MAX_RETRIES = 5
@@ -114,6 +115,13 @@ async def run_with_retries():
             await app.start()
             user = await app.get_me()
             print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
+
+            # Debug target channel
+            try:
+                chat = await app.get_chat(TARGET_CHANNEL)
+                print(f"✅ Target chat accessible: {chat.title}")
+            except Exception as e:
+                print(f"❌ Cannot access target chat: {e}")
 
             # Catch up once at start
             await catch_up()
@@ -137,12 +145,13 @@ async def run_with_retries():
         except Exception as e:
             print(f"⚠️ Unexpected error: {e}")
         finally:
-            try:
-                await app.stop()
-            except Exception:
-                pass
+            if app.is_connected:
+                try:
+                    await app.stop()
+                except Exception:
+                    pass
 
-        await asyncio.sleep(5)  # backoff before retry
+        await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(run_with_retries())
