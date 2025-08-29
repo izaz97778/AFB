@@ -82,7 +82,6 @@ async def forward_messages(client, message):
 
 # --- Start the bot ---
 async def start_bot():
-    await app.start()
     user = await app.get_me()
     print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
 
@@ -99,7 +98,8 @@ async def run_with_retries():
 
     while True:
         try:
-            await app.run(start_bot())
+            await app.start()
+            await start_bot()
         except RPCError as e:
             if "PERSISTENT_TIMESTAMP_OUTDATED" in str(e):
                 retries += 1
@@ -115,6 +115,8 @@ async def run_with_retries():
                 print(f"⚠️ RPCError: {e}")
         except Exception as e:
             print(f"⚠️ Unexpected error: {e}")
+        finally:
+            await app.stop()
 
         await asyncio.sleep(5)  # backoff before retry
 
