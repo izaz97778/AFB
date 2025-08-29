@@ -10,14 +10,17 @@ print("Starting...")
 uvloop.install()
 
 # Regex for checking numeric IDs (e.g. -100...)
-id_pattern = re.compile(r'^.\d+$')
+id_pattern = re.compile(r"^-?\d+$")
 
 # Load from environment
 SESSION = os.environ.get("SESSION", "")
-API_ID = int(os.environ.get("API_ID", ""))
+API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
-TARGET_CHANNEL = int(os.environ.get("TARGET_CHANNEL", ""))
-SOURCE_CHANNELS = [int(ch) if id_pattern.search(ch) else ch for ch in os.environ.get("SOURCE_CHANNELS", "").split()]
+TARGET_CHANNEL = int(os.environ.get("TARGET_CHANNEL", "0"))
+SOURCE_CHANNELS = [
+    int(ch) if id_pattern.search(ch) else ch
+    for ch in os.environ.get("SOURCE_CHANNELS", "").split()
+]
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 
 # Setup MongoDB
@@ -45,19 +48,16 @@ app = Client(
     api_hash=API_HASH
 )
 
-# --- Catch-up routine ---
-async def catch_up():
-    for src in SOURCE_CHANNELS:
-        last_id = get_last_forwarded(src)
-        print(f"📌 Catching up {src} from message_id > {last_id} ...")
-        try:
-            async for msg in app.get_chat_history(src, offset_id=last_id, reverse=True):
-                await forward_one(src, msg)
-        except Exception as e:
-            print(f"⚠️ Error in catch-up for {src}: {e}")
-
 # --- Forwarding helper ---
 async def forward_one(chat_id, message):
+    # Skip service/unsupported messages
+    if getattr(message, "service", False):
+        return
+
+    # Dedup (double-check against Mongo in case of overlap)
+    if message.id <= get_last_forwarded(chat_id):
+        return
+
     while True:
         try:
             await message.copy(TARGET_CHANNEL)
@@ -71,27 +71,26 @@ async def forward_one(chat_id, message):
             print(f"❌ Error forwarding message {message.id} from {chat_id}: {e}")
             break
 
-# --- On new messages ---
-@app.on_message(filters.channel)
+# --- Catch-up routine ---
+async def catch_up():
+    for src in SOURCE_CHANNELS:
+        last_id = get_last_forwarded(src)
+        print(f"📌 Catching up {src} from message_id > {last_id} ...")
+        try:
+            async for msg in app.get_chat_history(src, offset_id=last_id, reverse=True):
+                # Skip service + ensure no duplicates even if restarted mid-batch
+                if getattr(msg, "service", False) or msg.id <= get_last_forwarded(src):
+                    continue
+                await forward_one(src, msg)
+        except Exception as e:
+            print(f"⚠️ Error in catch-up for {src}: {e}")
+
+# --- On new messages (only from configured sources) ---
+@app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
-    if message.chat.id in SOURCE_CHANNELS:
-        last_id = get_last_forwarded(message.chat.id)
-        if message.id <= last_id:
-            return  # Already forwarded
-        await forward_one(message.chat.id, message)
+    await forward_one(message.chat.id, message)
 
-# --- Start the bot ---
-async def start_bot():
-    user = await app.get_me()
-    print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
-
-    # catch up missed messages
-    await catch_up()
-
-    # keep alive
-    await asyncio.Event().wait()
-
-# --- Error handling wrapper ---
+# --- Main lifecycle (manual control; no app.run here) ---
 async def run_with_retries():
     retries = 0
     MAX_RETRIES = 5
@@ -99,7 +98,15 @@ async def run_with_retries():
     while True:
         try:
             await app.start()
-            await start_bot()
+            user = await app.get_me()
+            print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
+
+            # Catch up once at start
+            await catch_up()
+
+            # Keep alive
+            await asyncio.Event().wait()
+
         except RPCError as e:
             if "PERSISTENT_TIMESTAMP_OUTDATED" in str(e):
                 retries += 1
@@ -116,7 +123,10 @@ async def run_with_retries():
         except Exception as e:
             print(f"⚠️ Unexpected error: {e}")
         finally:
-            await app.stop()
+            try:
+                await app.stop()
+            except Exception:
+                pass
 
         await asyncio.sleep(5)  # backoff before retry
 
