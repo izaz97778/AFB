@@ -3,16 +3,14 @@ import asyncio
 import os
 import re
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden
+from pyrogram.errors import FloodWait, RPCError, ChatWriteForbidden, TransportError
 from pymongo import MongoClient
 
 print("Starting...")
 uvloop.install()
 
-# Regex for checking numeric IDs (e.g. -100...)
 id_pattern = re.compile(r"^-?\d+$")
 
-# Load from environment
 SESSION = os.environ.get("SESSION", "")
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
@@ -23,12 +21,10 @@ SOURCE_CHANNELS = [
 ]
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 
-# Setup MongoDB
 mongo = MongoClient(MONGO_URI)
 db = mongo["forwarding_bot"]
 state_collection = db["forward_state"]
 
-# --- MongoDB Helpers ---
 def get_last_forwarded(chat_id):
     doc = state_collection.find_one({"_id": str(chat_id)})
     return doc["last_message_id"] if doc else 0
@@ -40,7 +36,6 @@ def save_last_forwarded(chat_id, message_id):
         upsert=True
     )
 
-# --- Pyrogram client setup ---
 app = Client(
     name="forwarder",
     session_string=SESSION,
@@ -48,29 +43,23 @@ app = Client(
     api_hash=API_HASH
 )
 
-# --- Forwarding queue ---
 forward_queue = asyncio.Queue()
 
-# --- Counters ---
 counters = {
     "queued": 0,
     "forwarded": 0,
     "skipped": 0
 }
 
-# --- Forwarding worker ---
+# --- Forwarding worker with transport flood handling ---
 async def forward_worker():
     while True:
         chat_id, msg = await forward_queue.get()
         await forward_one(chat_id, msg)
         forward_queue.task_done()
 
-# --- Forwarding helper ---
 async def forward_one(chat_id, message):
-    if getattr(message, "service", False):
-        counters["skipped"] += 1
-        return
-    if message.id <= get_last_forwarded(chat_id):
+    if getattr(message, "service", False) or message.id <= get_last_forwarded(chat_id):
         counters["skipped"] += 1
         return
 
@@ -79,22 +68,24 @@ async def forward_one(chat_id, message):
             await message.copy(TARGET_CHANNEL)
             save_last_forwarded(chat_id, message.id)
             counters["forwarded"] += 1
-            print(f"✅ Forwarded message {message.id} from {chat_id} to {TARGET_CHANNEL} "
+            print(f"✅ Forwarded message {message.id} from {chat_id} "
                   f"| Forwarded: {counters['forwarded']} | Queued: {counters['queued']} | Skipped: {counters['skipped']}")
             break
         except FloodWait as e:
-            print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id} from {chat_id}")
+            print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id}")
             await asyncio.sleep(e.value)
+        except TransportError as e:
+            print(f"⚠️ Transport flood detected, pausing 30s: {e}")
+            await asyncio.sleep(30)
         except ChatWriteForbidden:
             print(f"❌ Cannot write to target channel {TARGET_CHANNEL}. Make sure userbot is admin.")
             counters["skipped"] += 1
             break
         except Exception as e:
-            print(f"❌ Error forwarding message {message.id} from {chat_id}: {e}")
+            print(f"❌ Error forwarding message {message.id}: {e}")
             counters["skipped"] += 1
             break
 
-# --- On new messages only ---
 @app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
     if message.id > get_last_forwarded(message.chat.id):
@@ -102,7 +93,6 @@ async def forward_messages(client, message):
         counters["queued"] += 1
         print(f"📥 New message queued {message.id} from {message.chat.id} | Queued: {counters['queued']}")
 
-# --- Main lifecycle ---
 async def run_with_retries():
     retries = 0
     MAX_RETRIES = 5
@@ -113,17 +103,13 @@ async def run_with_retries():
             user = await app.get_me()
             print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
 
-            # Debug target channel
             try:
                 chat = await app.get_chat(TARGET_CHANNEL)
                 print(f"✅ Target chat accessible: {chat.title}")
             except Exception as e:
                 print(f"❌ Cannot access target chat: {e}")
 
-            # Start forward worker
             asyncio.create_task(forward_worker())
-
-            # Keep alive
             await asyncio.Event().wait()
 
         except RPCError as e:
