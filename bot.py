@@ -42,11 +42,20 @@ def save_last_forwarded(chat_id, message_id):
 
 # --- Pyrogram client setup ---
 app = Client(
-    name="forwarder",          # fixed name
+    name="forwarder",
     session_string=SESSION,
     api_id=API_ID,
     api_hash=API_HASH
 )
+
+# --- Forwarding queue ---
+forward_queue = asyncio.Queue()
+
+async def forward_worker():
+    while True:
+        chat_id, msg = await forward_queue.get()
+        await forward_one(chat_id, msg)
+        forward_queue.task_done()
 
 # --- Forwarding helper ---
 async def forward_one(chat_id, message):
@@ -73,37 +82,37 @@ async def forward_one(chat_id, message):
             break
 
 # --- Catch-up routine ---
-async def catch_up():
-    for src in SOURCE_CHANNELS:
-        last_id = get_last_forwarded(src)
-
-        # If this is a new source channel → skip history
-        if last_id == 0:
-            try:
-                async for m in app.get_chat_history(src, limit=1):
-                    save_last_forwarded(src, m.id)
-                    last_id = m.id
-                    print(f"🆕 Initialized {src} at message_id {last_id} (skipping history)")
-            except Exception as e:
-                print(f"⚠️ Could not initialize {src}: {e}")
-                continue
-
-        print(f"📌 Catching up {src} from message_id > {last_id} ...")
+async def catch_up_channel(chat_id):
+    last_id = get_last_forwarded(chat_id)
+    # If new source channel → skip history
+    if last_id == 0:
         try:
-            # Fetch messages newer than last_id
-            async for msg in app.get_chat_history(src, offset_id=last_id - 1, reverse=True, limit=1000):
-                if getattr(msg, "service", False) or msg.id <= get_last_forwarded(src):
-                    continue
-                print(f"➡️ Found message {msg.id} from {src}, forwarding...")
-                await forward_one(src, msg)
+            async for m in app.get_chat_history(chat_id, limit=1):
+                save_last_forwarded(chat_id, m.id)
+                last_id = m.id
+                print(f"🆕 Initialized {chat_id} at message_id {last_id} (skipping history)")
         except Exception as e:
-            print(f"⚠️ Error in catch-up for {src}: {e}")
+            print(f"⚠️ Could not initialize {chat_id}: {e}")
+            return
+
+    print(f"📌 Catching up {chat_id} from message_id > {last_id} ...")
+    try:
+        async for msg in app.get_chat_history(chat_id, offset_id=last_id - 1, reverse=True, limit=1000):
+            if getattr(msg, "service", False) or msg.id <= get_last_forwarded(chat_id):
+                continue
+            await forward_queue.put((chat_id, msg))
+    except Exception as e:
+        print(f"⚠️ Error in catch-up for {chat_id}: {e}")
+
+async def catch_up_all():
+    tasks = [asyncio.create_task(catch_up_channel(cid)) for cid in SOURCE_CHANNELS]
+    await asyncio.gather(*tasks)
 
 # --- On new messages ---
 @app.on_message(filters.chat(SOURCE_CHANNELS))
 async def forward_messages(client, message):
     if message.id > get_last_forwarded(message.chat.id):
-        await forward_one(message.chat.id, message)
+        await forward_queue.put((message.chat.id, message))
 
 # --- Main lifecycle ---
 async def run_with_retries():
@@ -123,8 +132,10 @@ async def run_with_retries():
             except Exception as e:
                 print(f"❌ Cannot access target chat: {e}")
 
-            # Catch up once at start
-            await catch_up()
+            # Start forward worker
+            asyncio.create_task(forward_worker())
+            # Start catch-up
+            await catch_up_all()
 
             # Keep alive
             await asyncio.Event().wait()
