@@ -1,76 +1,32 @@
 import uvloop
 import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 from pymongo import MongoClient
 import re
 from os import environ
+import asyncio
 
-uvloop.install()
 print("Starting...")
+uvloop.install()
 
-# Regex for numeric IDs
-id_pattern = re.compile(r'^-?\d+$')
+# Regex for checking numeric IDs (e.g. -100...)
+id_pattern = re.compile(r'^.\d+$')
 
-# --- Environment variables ---
+# Load from environment
 SESSION = environ.get("SESSION", "")
 API_ID = int(environ.get("API_ID", ""))
 API_HASH = environ.get("API_HASH", "")
-BOT_TOKEN = environ.get("BOT_TOKEN", "")
+TARGET_CHANNEL = int(environ.get("TARGET_CHANNEL", ""))
+SOURCE_CHANNELS = [int(ch) if id_pattern.search(ch) else ch for ch in environ.get("SOURCE_CHANNELS", "").split()]
 MONGO_URI = environ.get("MONGO_URI", "mongodb://localhost:27017")
 
-# --- MongoDB setup ---
+# Setup MongoDB
 mongo = MongoClient(MONGO_URI)
 db = mongo["forwarding_bot"]
 state_collection = db["forward_state"]
-config_collection = db["config"]
 
-# --- First-time setup ---
-if not config_collection.find_one({"_id": "main"}):
-    # ⚠️ Replace with your real IDs
-    initial_target = -1002562176374
-    initial_sources = [
-        -1003062358024, -1001995810221, -1002692909866, -1002701216824, -1002974269597,
-        -1003002828125, -1002605464440, -1003032987809, -1002359961063, -1002870980867,
-        -1001267885871, -1002513910612, -1001615681369, -1002645168895, -1001692104049,
-        -1003054701875, -1002590466015, -1003030606358, -1003086093222, -1003082342762,
-        -1002766230848, -1002883951301, -1002929385575, -1002673475553, -1002310882853,
-        -1002995730319, -1003048704910, -1002570474246, -1002525291498, -1002805412416,
-        -1002704288270, -1002688446896, -1002904110455, -1002537616822, -1002820033697,
-        -1003011645187, -1002717982158, -1002747946683, -1002635529053, -1002071977054,
-        -1002567159570, -1002728791130, -1002617481429, -1002842926295, -1002896849864,
-        -1002603343644, -1002795822830, -1002698739973, -1002523447534, -1002464668943,
-        -1002746167272, -1002852213235, -1002646161494, -1002628443112, -1002815509088,
-        -1002802502931, -1002830554755, -1002256858596, -1002686400755, -1001945247286,
-        -1002892518819, -1002542636490, -1002548059741, -1002364955763, -1001961755638,
-        -1002845156656, -1002620354260, -1002818722105, -1002726550105, -1002640125569,
-        -1002843569131, -1002813701079, -1002394425543, -1002621015649, -1002657598430,
-        -1002439173562, -1002552452659, -1002287995762, -1002112854589, -1002903711312,
-        -1002775929686, -1002980343109, -1002484085103
-    ]
-    config_collection.insert_one({
-        "_id": "main",
-        "target_channel": initial_target,
-        "source_channels": initial_sources
-    })
-    print(f"✅ First-time config saved.\nTarget: {initial_target}\nSources: {initial_sources}")
-
-# --- Load configuration ---
-def load_config():
-    cfg = config_collection.find_one({"_id": "main"})
-    if not cfg:
-        cfg = {"_id": "main", "target_channel": 0, "source_channels": []}
-        config_collection.insert_one(cfg)
-    return cfg
-
-config = load_config()
-TARGET_CHANNEL = config["target_channel"]
-SOURCE_CHANNELS = config["source_channels"]
-
-print(f"✅ Loaded config.\nTarget: {TARGET_CHANNEL}\nSources: {SOURCE_CHANNELS}")
-
-# --- MongoDB helpers ---
+# --- MongoDB Helpers ---
 def get_last_forwarded(chat_id):
     doc = state_collection.find_one({"_id": str(chat_id)})
     return doc["last_message_id"] if doc else 0
@@ -82,32 +38,30 @@ def save_last_forwarded(chat_id, message_id):
         upsert=True
     )
 
-def save_config():
-    config_collection.update_one({"_id": "main"}, {"$set": config}, upsert=True)
-
-# --- Pyrogram clients ---
-userbot = Client(
+# --- Pyrogram client setup ---
+app = Client(
     name=SESSION,
     session_string=SESSION,
     api_id=API_ID,
     api_hash=API_HASH
 )
 
-bot = Client(
-    name="bot",
-    bot_token=BOT_TOKEN,
-    api_id=API_ID,
-    api_hash=API_HASH
-)
+# --- Start the bot ---
+async def start_bot():
+    await app.start()
+    user = await app.get_me()
+    print(f"✅ Logged in as: {user.first_name} (@{user.username}) [{user.id}]")
+    await asyncio.Event().wait()
 
-# --- Forwarding handler ---
-@userbot.on_message(filters.channel)
+# --- Message Forward Handler ---
+@app.on_message(filters.channel)
 async def forward_messages(client, message):
     if message.chat.id in SOURCE_CHANNELS:
         chat_id = str(message.chat.id)
         last_id = get_last_forwarded(chat_id)
+
         if message.id <= last_id:
-            return
+            return  # Already forwarded
 
         while True:
             try:
@@ -116,87 +70,11 @@ async def forward_messages(client, message):
                 save_last_forwarded(chat_id, message.id)
                 break
             except FloodWait as e:
-                print(f"⚠️ FloodWait: Waiting {e.value}s for message {message.id}")
+                print(f"⏳ FloodWait: Waiting {e.value}s for message {message.id} from {chat_id}")
                 await asyncio.sleep(e.value)
             except Exception as e:
-                print(f"❌ Error forwarding message {message.id}: {e}")
+                print(f"❌ Error forwarding message {message.id} from {chat_id}: {e}")
                 break
 
-# --- Bot commands with button interface ---
-@bot.on_message(filters.private & filters.command("start"))
-async def start_cmd(c, m):
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Add Source", callback_data="add_source"),
-             InlineKeyboardButton("Remove Source", callback_data="remove_source")],
-            [InlineKeyboardButton("Set Target", callback_data="set_target")],
-            [InlineKeyboardButton("Show Config", callback_data="show_config")]
-        ]
-    )
-    await m.reply("Manage your forwarding bot:", reply_markup=keyboard)
-
-@bot.on_callback_query()
-async def handle_buttons(c, query):
-    data = query.data
-
-    if data == "show_config":
-        await query.message.edit_text(f"📝 Current config:\nTarget: {TARGET_CHANNEL}\nSources: {SOURCE_CHANNELS}")
-
-    elif data == "add_source":
-        await query.message.edit_text("Send the channel ID or username to add as source:")
-
-        @bot.on_message(filters.private & filters.incoming)
-        async def receive_add(m_c, m):
-            ch = m.text
-            if id_pattern.search(ch):
-                ch = int(ch)
-            if ch not in SOURCE_CHANNELS:
-                SOURCE_CHANNELS.append(ch)
-                config["source_channels"] = SOURCE_CHANNELS
-                save_config()
-                await m.reply(f"✅ Added source channel: {ch}")
-            else:
-                await m.reply("⚠️ Channel already exists.")
-            bot.remove_handler(receive_add)
-
-    elif data == "remove_source":
-        await query.message.edit_text("Send the channel ID or username to remove from sources:")
-
-        @bot.on_message(filters.private & filters.incoming)
-        async def receive_remove(m_c, m):
-            ch = m.text
-            if id_pattern.search(ch):
-                ch = int(ch)
-            if ch in SOURCE_CHANNELS:
-                SOURCE_CHANNELS.remove(ch)
-                config["source_channels"] = SOURCE_CHANNELS
-                save_config()
-                await m.reply(f"❌ Removed source channel: {ch}")
-            else:
-                await m.reply("⚠️ Channel not found.")
-            bot.remove_handler(receive_remove)
-
-    elif data == "set_target":
-        await query.message.edit_text("Send the channel ID or username to set as target:")
-
-        @bot.on_message(filters.private & filters.incoming)
-        async def receive_target(m_c, m):
-            ch = m.text
-            if id_pattern.search(ch):
-                ch = int(ch)
-            global TARGET_CHANNEL
-            TARGET_CHANNEL = ch
-            config["target_channel"] = TARGET_CHANNEL
-            save_config()
-            await m.reply(f"🎯 Target channel set to: {TARGET_CHANNEL}")
-            bot.remove_handler(receive_target)
-
-# --- Run both clients ---
-async def main():
-    await userbot.start()
-    print("✅ Userbot started")
-    await bot.start()
-    print("✅ Bot started")
-    await asyncio.Event().wait()
-
-asyncio.run(main())
+# --- Run the app ---
+app.run(start_bot())
